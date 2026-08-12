@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-GitHub Trending Daily -> Feishu Push (Webhook + Gemini AI version)
+GitHub Trending Daily -> Feishu Push (Webhook + OpenRouter AI version)
 
-Scrapes GitHub trending page, picks top 5 repos, uses Gemini AI to generate
-easy-to-understand Chinese explanations with use cases, and sends a rich
-card message to Feishu via custom bot webhook.
+Scrapes GitHub trending page, picks top 5 repos, uses OpenRouter AI (Gemini)
+to generate easy-to-understand Chinese explanations with use cases, and sends
+a rich card message to Feishu via custom bot webhook.
 
 Runs on GitHub Actions - no PC required, completely free.
 """
@@ -21,11 +21,18 @@ from datetime import datetime, timezone, timedelta
 # Config
 # ---------------------------------------------------------------------------
 FEISHU_WEBHOOK_URL = os.environ.get("FEISHU_WEBHOOK_URL", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 GITHUB_TRENDING_URL = "https://github.com/trending?since=daily"
 GITHUB_API = "https://api.github.com"
-GEMINI_API = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODELS = [
+    "google/gemma-4-31b-it:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "openai/gpt-oss-20b:free",
+    "nvidia/nemotron-3-nano-30b-a3b:free",
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+]
 REQUEST_TIMEOUT = 30
 TOP_N = 5
 
@@ -154,10 +161,11 @@ def fetch_readme(repo_name):
 
 
 # ---------------------------------------------------------------------------
-# Step 3: Use Gemini AI to generate Chinese explanation
+# Step 3: Use OpenRouter AI to generate Chinese explanation
 # ---------------------------------------------------------------------------
 def generate_explanation(repo):
-    """Use Gemini API to generate easy-to-understand Chinese explanation."""
+    """Use OpenRouter AI to generate easy-to-understand Chinese explanation.
+    Tries multiple free models with fallback."""
     readme = fetch_readme(repo["name"])
 
     prompt = f"""你是一个技术科普作者，擅长用大白话解释技术项目。请分析以下GitHub项目，用通俗易懂的中文生成解读。
@@ -177,39 +185,55 @@ README摘要:
   "适合人群": "用一句话说明这个项目适合什么人"
 }}"""
 
-    headers = {"Content-Type": "application/json"}
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.7,
-            "maxOutputTokens": 800,
-        },
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/zhiguangzhang948-eng/github-trending-daily",
+        "X-Title": "GitHub Trending Daily",
     }
 
-    for attempt in range(2):
-        try:
-            resp = requests.post(
-                f"{GEMINI_API}?key={GEMINI_API_KEY}",
-                headers=headers,
-                json=payload,
-                timeout=60,
-            )
-            if resp.status_code == 200:
-                text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-                # Clean up: remove markdown code block if present
-                text = text.strip()
-                if text.startswith("```"):
-                    text = re.sub(r"^```(?:json)?\s*", "", text)
-                    text = re.sub(r"\s*```$", "", text)
-                return json.loads(text)
-            else:
-                print(f"  Gemini API error {resp.status_code}: {resp.text[:200]}")
+    for model in OPENROUTER_MODELS:
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": "你是一个技术科普作者，擅长用通俗易懂的中文解释技术项目。只输出JSON，不输出其他内容。"},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.7,
+            "max_tokens": 800,
+        }
+
+        for attempt in range(2):
+            try:
+                resp = requests.post(
+                    OPENROUTER_API,
+                    headers=headers,
+                    json=payload,
+                    timeout=60,
+                )
+                if resp.status_code == 200:
+                    text = resp.json()["choices"][0]["message"]["content"]
+                    # Clean up: remove markdown code block if present
+                    text = text.strip()
+                    if text.startswith("```"):
+                        text = re.sub(r"^```(?:json)?\s*", "", text)
+                        text = re.sub(r"\s*```$", "", text)
+                    return json.loads(text)
+                elif resp.status_code == 429:
+                    print(f"  {model} rate-limited, trying next model...")
+                    break  # Try next model
+                else:
+                    print(f"  {model} error {resp.status_code}: {resp.text[:150]}")
+                    if attempt < 1:
+                        time.sleep(3)
+            except json.JSONDecodeError as e:
+                print(f"  {model} JSON parse failed: {e}")
+                if attempt < 1:
+                    time.sleep(2)
+            except Exception as e:
+                print(f"  {model} attempt {attempt+1} failed: {e}")
                 if attempt < 1:
                     time.sleep(3)
-        except Exception as e:
-            print(f"  Gemini attempt {attempt+1} failed: {e}")
-            if attempt < 1:
-                time.sleep(3)
 
     # Fallback: return basic info
     return {
@@ -244,7 +268,7 @@ def build_card_message(repos):
         info = repo.get("ai_explanation", {})
 
         # Project title line
-        md = f"**{i}. [{repo['name']}]({f'https://github.com/{repo["name"]}'})**"
+        md = f"**{i}. [{repo['name']}](https://github.com/{repo['name']})**"
         md += f"  |  ⭐ {stars} (+{today_num}今日)\n"
 
         # One-line summary (highlighted)
@@ -282,7 +306,7 @@ def build_card_message(repos):
         "tag": "note",
         "elements": [
             {"tag": "plain_text",
-             "content": "GitHub 每日精选 | AI 解读 | 每天推送 5 个优质项目 | 数据来源: GitHub Trending"}
+             "content": "GitHub 每日精选 | AI 深度解读 | 每天推送 5 个优质项目 | 数据来源: GitHub Trending"}
         ]
     })
 
@@ -332,8 +356,8 @@ def main():
     if not FEISHU_WEBHOOK_URL:
         print("ERROR: FEISHU_WEBHOOK_URL is not set!")
         sys.exit(1)
-    if not GEMINI_API_KEY:
-        print("ERROR: GEMINI_API_KEY is not set!")
+    if not OPENROUTER_API_KEY:
+        print("ERROR: OPENROUTER_API_KEY is not set!")
         sys.exit(1)
 
     # Step 1: Fetch trending
