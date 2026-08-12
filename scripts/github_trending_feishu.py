@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-GitHub Trending Daily -> Feishu Push (Webhook version)
+GitHub Trending Daily -> Feishu Push (Webhook + Gemini AI version)
 
-Scrapes GitHub trending page, translates descriptions to Chinese,
-and sends a card message to Feishu via custom bot webhook.
+Scrapes GitHub trending page, picks top 5 repos, uses Gemini AI to generate
+easy-to-understand Chinese explanations with use cases, and sends a rich
+card message to Feishu via custom bot webhook.
 
 Runs on GitHub Actions - no PC required, completely free.
 """
@@ -20,9 +21,13 @@ from datetime import datetime, timezone, timedelta
 # Config
 # ---------------------------------------------------------------------------
 FEISHU_WEBHOOK_URL = os.environ.get("FEISHU_WEBHOOK_URL", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 GITHUB_TRENDING_URL = "https://github.com/trending?since=daily"
+GITHUB_API = "https://api.github.com"
+GEMINI_API = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 REQUEST_TIMEOUT = 30
+TOP_N = 5
 
 
 # ---------------------------------------------------------------------------
@@ -122,29 +127,105 @@ def extract_today_star_num(today_str):
 
 
 # ---------------------------------------------------------------------------
-# Step 2: Translate descriptions to Chinese
+# Step 2: Fetch README for each repo
 # ---------------------------------------------------------------------------
-def translate_to_chinese(text):
-    """Translate English text to Chinese. Falls back to original on failure."""
-    if not text:
-        return "暂无描述"
+def fetch_readme(repo_name):
+    """Fetch README content for a repo via GitHub API."""
+    headers = {
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "github-trending-daily",
+    }
     try:
-        from deep_translator import GoogleTranslator
-        translator = GoogleTranslator(source="en", target="zh-CN")
-        result = translator.translate(text)
-        if result and len(result) > 1:
-            return result
-        return text
+        resp = requests.get(
+            f"{GITHUB_API}/repos/{repo_name}/readme",
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code == 200:
+            import base64
+            content = resp.json().get("content", "")
+            if content:
+                decoded = base64.b64decode(content).decode("utf-8", errors="ignore")
+                # Truncate to first 3000 chars to keep prompt size reasonable
+                return decoded[:3000]
     except Exception as e:
-        print(f"  Translation failed, using original: {e}")
-        return text
+        print(f"  README fetch failed for {repo_name}: {e}")
+    return ""
 
 
 # ---------------------------------------------------------------------------
-# Step 3: Build Feishu card message
+# Step 3: Use Gemini AI to generate Chinese explanation
 # ---------------------------------------------------------------------------
-def build_card_message(repos, top_n=10):
-    """Build Feishu interactive card JSON from repo list."""
+def generate_explanation(repo):
+    """Use Gemini API to generate easy-to-understand Chinese explanation."""
+    readme = fetch_readme(repo["name"])
+
+    prompt = f"""你是一个技术科普作者，擅长用大白话解释技术项目。请分析以下GitHub项目，用通俗易懂的中文生成解读。
+
+项目名: {repo['name']}
+描述: {repo['description']}
+编程语言: {repo['language']}
+README摘要:
+{readme[:2000]}
+
+请严格按照以下JSON格式输出（不要输出其他内容，不要用markdown代码块包裹）:
+{{
+  "一句话简介": "用15-25个字概括这个项目是干什么的，让非技术人员也能听懂",
+  "详细解释": "用2-3句话解释这个项目的核心功能和价值，用大白话，不要用专业术语",
+  "应用场景": "列出2-3个具体的使用场景，每个场景一行，说明什么人会在什么情况下用它",
+  "怎么用": "用1-2句话说明怎么上手使用，比如安装方式或访问方式",
+  "适合人群": "用一句话说明这个项目适合什么人"
+}}"""
+
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.7,
+            "maxOutputTokens": 800,
+        },
+    }
+
+    for attempt in range(2):
+        try:
+            resp = requests.post(
+                f"{GEMINI_API}?key={GEMINI_API_KEY}",
+                headers=headers,
+                json=payload,
+                timeout=60,
+            )
+            if resp.status_code == 200:
+                text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+                # Clean up: remove markdown code block if present
+                text = text.strip()
+                if text.startswith("```"):
+                    text = re.sub(r"^```(?:json)?\s*", "", text)
+                    text = re.sub(r"\s*```$", "", text)
+                return json.loads(text)
+            else:
+                print(f"  Gemini API error {resp.status_code}: {resp.text[:200]}")
+                if attempt < 1:
+                    time.sleep(3)
+        except Exception as e:
+            print(f"  Gemini attempt {attempt+1} failed: {e}")
+            if attempt < 1:
+                time.sleep(3)
+
+    # Fallback: return basic info
+    return {
+        "一句话简介": repo["description"] or "暂无描述",
+        "详细解释": "无法获取AI解读，请访问项目页面了解更多。",
+        "应用场景": "请访问项目主页查看。",
+        "怎么用": "请访问项目主页查看使用文档。",
+        "适合人群": "对相关技术感兴趣的开发者。",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Step 4: Build Feishu card message
+# ---------------------------------------------------------------------------
+def build_card_message(repos):
+    """Build Feishu interactive card JSON with rich AI-generated content."""
     tz = timezone(timedelta(hours=8))
     today = datetime.now(tz).strftime("%Y年%m月%d日")
 
@@ -153,21 +234,46 @@ def build_card_message(repos, top_n=10):
     # Date header
     elements.append({
         "tag": "markdown",
-        "content": f"**{today}**\n\n---"
+        "content": f"**{today}** | 精选 {TOP_N} 个最值得关注的项目\n\n---"
     })
 
-    # Top N repos
-    for i, repo in enumerate(repos[:top_n], 1):
-        desc_zh = translate_to_chinese(repo["description"])
+    # Top N repos with AI explanations
+    for i, repo in enumerate(repos[:TOP_N], 1):
         stars = format_star_count(repo["total_stars"])
         today_num = extract_today_star_num(repo["today_stars"])
+        info = repo.get("ai_explanation", {})
 
-        md = (
-            f"**{i}. [{repo['name']}](https://github.com/{repo['name']})**  "
-            f"⭐ {stars} (+{today_num}📈)\n"
-            f"> {desc_zh}\n"
-            f"语言: {repo['language']}"
-        )
+        # Project title line
+        md = f"**{i}. [{repo['name']}]({f'https://github.com/{repo["name"]}'})**"
+        md += f"  |  ⭐ {stars} (+{today_num}今日)\n"
+
+        # One-line summary (highlighted)
+        one_line = info.get("一句话简介", "")
+        md += f"\n📌 **{one_line}**\n"
+
+        # Detailed explanation
+        detail = info.get("详细解释", "")
+        if detail:
+            md += f"\n{detail}\n"
+
+        # Application scenarios
+        scenarios = info.get("应用场景", "")
+        if scenarios:
+            md += f"\n🎯 **应用场景**\n{scenarios}\n"
+
+        # How to use
+        how_to = info.get("怎么用", "")
+        if how_to:
+            md += f"\n🚀 **怎么用**\n{how_to}\n"
+
+        # Target audience
+        audience = info.get("适合人群", "")
+        if audience:
+            md += f"\n👤 适合: {audience}\n"
+
+        # Language
+        md += f"\n🔧 语言: {repo['language']}"
+
         elements.append({"tag": "markdown", "content": md})
         elements.append({"tag": "hr"})
 
@@ -176,7 +282,7 @@ def build_card_message(repos, top_n=10):
         "tag": "note",
         "elements": [
             {"tag": "plain_text",
-             "content": "每日 8:00 自动推送 | 数据来源: GitHub Trending | GitHub Actions 驱动"}
+             "content": "GitHub 每日精选 | AI 解读 | 每天推送 5 个优质项目 | 数据来源: GitHub Trending"}
         ]
     })
 
@@ -184,7 +290,7 @@ def build_card_message(repos, top_n=10):
         "config": {"wide_screen_mode": True, "enable_forward": True},
         "header": {
             "title": {"tag": "plain_text",
-                      "content": "GitHub 每日热门 Top 10"},
+                      "content": "GitHub 每日精选 Top 5 | AI 深度解读"},
             "template": "blue"
         },
         "elements": elements
@@ -193,7 +299,7 @@ def build_card_message(repos, top_n=10):
 
 
 # ---------------------------------------------------------------------------
-# Step 4: Send to Feishu via Webhook
+# Step 5: Send to Feishu via Webhook
 # ---------------------------------------------------------------------------
 def send_feishu_webhook(card):
     """Send interactive card message to Feishu via custom bot webhook."""
@@ -207,9 +313,7 @@ def send_feishu_webhook(card):
     result = resp.json()
 
     if result.get("code") != 0 and result.get("StatusCode") != 0:
-        # Some webhook responses use different field names
         if result.get("code") is None and result.get("StatusCode") is None:
-            # If no error code at all, assume success
             print(f"  Response: {result}")
             return result
         raise RuntimeError(f"Feishu webhook send failed: {result}")
@@ -222,33 +326,40 @@ def send_feishu_webhook(card):
 # ---------------------------------------------------------------------------
 def main():
     print("=" * 50)
-    print("GitHub Trending -> Feishu Push (Webhook)")
+    print("GitHub Trending -> Feishu Push (AI Enhanced)")
     print("=" * 50)
 
-    # Validate config
     if not FEISHU_WEBHOOK_URL:
         print("ERROR: FEISHU_WEBHOOK_URL is not set!")
         sys.exit(1)
+    if not GEMINI_API_KEY:
+        print("ERROR: GEMINI_API_KEY is not set!")
+        sys.exit(1)
 
     # Step 1: Fetch trending
-    print("\n[1/4] Fetching GitHub Trending...")
+    print(f"\n[1/4] Fetching GitHub Trending...")
     repos = fetch_trending()
     print(f"  Found {len(repos)} repos")
     if not repos:
         print("ERROR: No repos found. Trending page may have changed.")
         sys.exit(1)
 
-    # Step 2: Translate
-    print("\n[2/4] Translating descriptions to Chinese...")
-    print(f"  Processing top {min(10, len(repos))} repos...")
+    # Step 2: Select top 5 and generate AI explanations
+    print(f"\n[2/4] Generating AI explanations for top {TOP_N} repos...")
+    for i, repo in enumerate(repos[:TOP_N]):
+        print(f"  [{i+1}/{TOP_N}] {repo['name']}...")
+        repo["ai_explanation"] = generate_explanation(repo)
+        # Small delay to avoid rate limiting
+        if i < TOP_N - 1:
+            time.sleep(1)
 
-    # Step 3: Build card
-    print("\n[3/4] Building Feishu card message...")
-    card = build_card_message(repos, top_n=10)
+    # Step 3: Build Feishu card
+    print(f"\n[3/4] Building Feishu card message...")
+    card = build_card_message(repos)
     print(f"  Card has {len(card['elements'])} elements")
 
     # Step 4: Send via webhook
-    print("\n[4/4] Sending to Feishu via webhook...")
+    print(f"\n[4/4] Sending to Feishu via webhook...")
     result = send_feishu_webhook(card)
     print(f"  Response: {result}")
 
