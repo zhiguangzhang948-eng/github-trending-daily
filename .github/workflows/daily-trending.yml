@@ -26,5 +26,6 @@ jobs:
       - name: Run trending push
         env:
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           python scripts/github_trending_feishu.py
