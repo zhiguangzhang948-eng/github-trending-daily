@@ -27,13 +27,12 @@ GITHUB_TRENDING_URL = "https://github.com/trending?since=daily"
 GITHUB_API = "https://api.github.com"
 OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS = [
+    "google/gemma-4-26b-a4b-it:free",
     "google/gemma-4-31b-it:free",
-    "nvidia/nemotron-3-super-120b-a12b:free",
     "openai/gpt-oss-20b:free",
-    "nvidia/nemotron-3-nano-30b-a3b:free",
-    "nvidia/nemotron-3-ultra-550b-a55b:free",
 ]
 REQUEST_TIMEOUT = 30
+AI_TIMEOUT = 45  # shorter timeout for AI calls
 TOP_N = 5
 
 
@@ -200,40 +199,44 @@ README摘要:
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.7,
-            "max_tokens": 800,
+            "max_tokens": 2000,  # increased for reasoning models
         }
 
-        for attempt in range(2):
-            try:
-                resp = requests.post(
-                    OPENROUTER_API,
-                    headers=headers,
-                    json=payload,
-                    timeout=60,
-                )
-                if resp.status_code == 200:
-                    text = resp.json()["choices"][0]["message"]["content"]
-                    # Clean up: remove markdown code block if present
-                    text = text.strip()
-                    if text.startswith("```"):
-                        text = re.sub(r"^```(?:json)?\s*", "", text)
-                        text = re.sub(r"\s*```$", "", text)
-                    return json.loads(text)
-                elif resp.status_code == 429:
-                    print(f"  {model} rate-limited, trying next model...")
-                    break  # Try next model
-                else:
-                    print(f"  {model} error {resp.status_code}: {resp.text[:150]}")
-                    if attempt < 1:
-                        time.sleep(3)
-            except json.JSONDecodeError as e:
-                print(f"  {model} JSON parse failed: {e}")
-                if attempt < 1:
-                    time.sleep(2)
-            except Exception as e:
-                print(f"  {model} attempt {attempt+1} failed: {e}")
-                if attempt < 1:
-                    time.sleep(3)
+        try:
+            resp = requests.post(
+                OPENROUTER_API,
+                headers=headers,
+                json=payload,
+                timeout=AI_TIMEOUT,
+            )
+            if resp.status_code == 200:
+                msg = resp.json()["choices"][0]["message"]
+                text = msg.get("content") or msg.get("reasoning") or ""
+                if not text:
+                    print(f"  {model} returned empty content, trying next model...")
+                    continue
+                # Clean up: remove markdown code block if present
+                text = text.strip()
+                if text.startswith("```"):
+                    text = re.sub(r"^```(?:json)?\s*", "", text)
+                    text = re.sub(r"\s*```$", "", text)
+                # Try to extract JSON from the text (in case reasoning mixed in)
+                json_match = re.search(r'\{[\s\S]*\}', text)
+                if json_match:
+                    return json.loads(json_match.group())
+                return json.loads(text)
+            elif resp.status_code == 429:
+                print(f"  {model} rate-limited, trying next model...")
+                continue  # Try next model
+            else:
+                print(f"  {model} error {resp.status_code}: {resp.text[:150]}")
+                continue  # Try next model
+        except json.JSONDecodeError as e:
+            print(f"  {model} JSON parse failed: {e}")
+            continue  # Try next model
+        except Exception as e:
+            print(f"  {model} failed: {e}")
+            continue  # Try next model
 
     # Fallback: return basic info
     return {
