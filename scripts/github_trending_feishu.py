@@ -351,6 +351,50 @@ def send_feishu_webhook(card):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def already_sent_today():
+    """Check if a scheduled run already succeeded or is in progress today.
+    Prevents duplicate sends when multiple cron triggers fire."""
+    token = os.environ.get("GITHUB_TOKEN", "")
+    if not token:
+        return False
+    try:
+        resp = requests.get(
+            "https://api.github.com/repos/zhiguangzhang948-eng/github-trending-daily/actions/runs?per_page=20",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "github-trending-daily",
+            },
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return False
+        runs = resp.json().get("workflow_runs", [])
+        tz = timezone(timedelta(hours=8))
+        today_str = datetime.now(tz).strftime("%Y-%m-%d")
+        for run in runs:
+            if run.get("event") != "schedule":
+                continue
+            created = run.get("created_at", "")
+            if not created:
+                continue
+            run_time = datetime.fromisoformat(created.replace("Z", "+00:00")).astimezone(tz)
+            if run_time.strftime("%Y-%m-%d") != today_str:
+                continue
+            status = run.get("status")
+            conclusion = run.get("conclusion")
+            if status == "in_progress":
+                print("  Another scheduled run is in progress today, skipping.")
+                return True
+            if status == "completed" and conclusion == "success":
+                print("  Already sent successfully today via scheduled run, skipping.")
+                return True
+        return False
+    except Exception as e:
+        print(f"  Dedup check failed (non-fatal): {e}")
+        return False
+
+
 def main():
     print("=" * 50)
     print("GitHub Trending -> Feishu Push (AI Enhanced)")
@@ -362,6 +406,11 @@ def main():
     if not OPENROUTER_API_KEY:
         print("ERROR: OPENROUTER_API_KEY is not set!")
         sys.exit(1)
+
+    # Dedup: skip if already sent today via scheduled run
+    if already_sent_today():
+        print("Exiting: already handled today.")
+        sys.exit(0)
 
     # Step 1: Fetch trending
     print(f"\n[1/4] Fetching GitHub Trending...")
