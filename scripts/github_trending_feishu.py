@@ -353,18 +353,19 @@ def send_feishu_webhook(card):
 # ---------------------------------------------------------------------------
 def already_sent_today():
     """Check if a scheduled run already succeeded or is in progress today.
-    Prevents duplicate sends when multiple cron triggers fire."""
+    Prevents duplicate sends when multiple cron triggers fire.
+    Uses public API (no auth needed for public repos, 60 req/hr limit is enough)."""
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "github-trending-daily",
+    }
     token = os.environ.get("GITHUB_TOKEN", "")
-    if not token:
-        return False
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     try:
         resp = requests.get(
             "https://api.github.com/repos/zhiguangzhang948-eng/github-trending-daily/actions/runs?per_page=20",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github+json",
-                "User-Agent": "github-trending-daily",
-            },
+            headers=headers,
             timeout=15,
         )
         if resp.status_code != 200:
