@@ -374,7 +374,8 @@ def already_sent_today():
         tz = timezone(timedelta(hours=8))
         today_str = datetime.now(tz).strftime("%Y-%m-%d")
         for run in runs:
-            if run.get("event") != "schedule":
+            event = run.get("event")
+            if event not in ("schedule", "workflow_dispatch"):
                 continue
             created = run.get("created_at", "")
             if not created:
