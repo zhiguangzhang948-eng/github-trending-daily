@@ -373,7 +373,12 @@ def already_sent_today():
         runs = resp.json().get("workflow_runs", [])
         tz = timezone(timedelta(hours=8))
         today_str = datetime.now(tz).strftime("%Y-%m-%d")
+        current_run_id = os.environ.get("GITHUB_RUN_ID", "")
         for run in runs:
+            # Skip the current run - it's always in_progress while we're executing
+            run_id = str(run.get("id", ""))
+            if current_run_id and run_id == current_run_id:
+                continue
             event = run.get("event")
             if event not in ("schedule", "workflow_dispatch"):
                 continue
@@ -385,11 +390,8 @@ def already_sent_today():
                 continue
             status = run.get("status")
             conclusion = run.get("conclusion")
-            if status == "in_progress":
-                print("  Another scheduled run is in progress today, skipping.")
-                return True
             if status == "completed" and conclusion == "success":
-                print("  Already sent successfully today via scheduled run, skipping.")
+                print("  Already sent successfully today via previous run, skipping.")
                 return True
         return False
     except Exception as e:
