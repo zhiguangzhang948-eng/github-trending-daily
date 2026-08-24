@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-GitHub Trending Daily -> Feishu Push (Webhook + OpenRouter AI version)
+GitHub Trending Daily -> Feishu Push (Webhook + Google Gemini AI version)
 
-Scrapes GitHub trending page, picks top 5 repos, uses OpenRouter AI (Gemini)
-to generate easy-to-understand Chinese explanations with use cases, and sends
-a rich card message to Feishu via custom bot webhook.
+Scrapes GitHub trending page, picks top 5 repos, uses Google Gemini API
+(gemini-2.5-flash, free tier) to generate easy-to-understand Chinese
+explanations with use cases, and sends a rich card message to Feishu via
+custom bot webhook.
 
 Runs on GitHub Actions - no PC required, completely free.
 """
@@ -21,15 +22,15 @@ from datetime import datetime, timezone, timedelta
 # Config
 # ---------------------------------------------------------------------------
 FEISHU_WEBHOOK_URL = os.environ.get("FEISHU_WEBHOOK_URL", "")
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 GITHUB_TRENDING_URL = "https://github.com/trending?since=daily"
 GITHUB_API = "https://api.github.com"
-OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODELS = [
-    "google/gemma-4-26b-a4b-it:free",
-    "google/gemma-4-31b-it:free",
-    "openai/gpt-oss-20b:free",
+# Google AI Studio (Gemini) - free tier, ~1500 requests/day
+GEMINI_API = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+GEMINI_MODEL_FALLBACKS = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
 ]
 REQUEST_TIMEOUT = 30
 AI_TIMEOUT = 45  # shorter timeout for AI calls
@@ -160,11 +161,11 @@ def fetch_readme(repo_name):
 
 
 # ---------------------------------------------------------------------------
-# Step 3: Use OpenRouter AI to generate Chinese explanation
+# Step 3: Use Gemini API to generate Chinese explanation
 # ---------------------------------------------------------------------------
 def generate_explanation(repo):
-    """Use OpenRouter AI to generate easy-to-understand Chinese explanation.
-    Tries multiple free models with fallback."""
+    """Use Google Gemini API to generate easy-to-understand Chinese explanation.
+    Uses response_schema to force strict JSON output (no reasoning token issues)."""
     readme = fetch_readme(repo["name"])
 
     prompt = f"""你是一个技术科普作者，擅长用大白话解释技术项目。请分析以下GitHub项目，用通俗易懂的中文生成解读。
@@ -175,68 +176,79 @@ def generate_explanation(repo):
 README摘要:
 {readme[:2000]}
 
-请严格按照以下JSON格式输出（不要输出其他内容，不要用markdown代码块包裹）:
-{{
-  "一句话简介": "用15-25个字概括这个项目是干什么的，让非技术人员也能听懂",
-  "详细解释": "用2-3句话解释这个项目的核心功能和价值，用大白话，不要用专业术语",
-  "应用场景": "列出2-3个具体的使用场景，每个场景一行，说明什么人会在什么情况下用它",
-  "怎么用": "用1-2句话说明怎么上手使用，比如安装方式或访问方式",
-  "适合人群": "用一句话说明这个项目适合什么人"
-}}"""
+请输出以下字段（全部用中文填写内容）:
+- summary: 用15-25个字概括这个项目是干什么的，让非技术人员也能听懂
+- detail: 用2-3句话解释这个项目的核心功能和价值，用大白话，不要用专业术语
+- scenarios: 列出2-3个具体的使用场景，每个场景一行，说明什么人会在什么情况下用它
+- usage: 用1-2句话说明怎么上手使用，比如安装方式或访问方式
+- audience: 用一句话说明这个项目适合什么人"""
 
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/zhiguangzhang948-eng/github-trending-daily",
-        "X-Title": "GitHub Trending Daily",
-    }
+    system_prompt = "你是一个技术科普作者，擅长用通俗易懂的中文解释技术项目。只输出JSON，不输出其他内容。"
 
-    for model in OPENROUTER_MODELS:
+    for model in GEMINI_MODEL_FALLBACKS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         payload = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": "你是一个技术科普作者，擅长用通俗易懂的中文解释技术项目。只输出JSON，不输出其他内容。"},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.7,
-            "max_tokens": 2000,  # increased for reasoning models
+            "systemInstruction": {"parts": [{"text": system_prompt}]},
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.7,
+                "maxOutputTokens": 2000,
+                "responseMimeType": "application/json",
+                "responseSchema": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "summary": {"type": "STRING"},
+                        "detail": {"type": "STRING"},
+                        "scenarios": {"type": "STRING"},
+                        "usage": {"type": "STRING"},
+                        "audience": {"type": "STRING"},
+                    },
+                    "required": ["summary", "detail", "scenarios", "usage", "audience"],
+                },
+            },
         }
 
         try:
             resp = requests.post(
-                OPENROUTER_API,
-                headers=headers,
+                url,
+                params={"key": GEMINI_API_KEY},
                 json=payload,
                 timeout=AI_TIMEOUT,
             )
             if resp.status_code == 200:
-                msg = resp.json()["choices"][0]["message"]
-                text = msg.get("content") or msg.get("reasoning") or ""
+                data = resp.json()
+                text = data["candidates"][0]["content"]["parts"][0]["text"]
                 if not text:
                     print(f"  {model} returned empty content, trying next model...")
                     continue
-                # Clean up: remove markdown code block if present
-                text = text.strip()
-                if text.startswith("```"):
-                    text = re.sub(r"^```(?:json)?\s*", "", text)
-                    text = re.sub(r"\s*```$", "", text)
-                # Try to extract JSON from the text (in case reasoning mixed in)
-                json_match = re.search(r'\{[\s\S]*\}', text)
-                if json_match:
-                    return json.loads(json_match.group())
-                return json.loads(text)
+                raw = json.loads(text)
+                # Map English schema keys back to Chinese keys used by the card builder
+                return {
+                    "一句话简介": raw.get("summary", repo["description"] or "暂无描述"),
+                    "详细解释": raw.get("detail", "无法获取AI解读，请访问项目页面了解更多。"),
+                    "应用场景": raw.get("scenarios", "请访问项目主页查看。"),
+                    "怎么用": raw.get("usage", "请访问项目主页查看使用文档。"),
+                    "适合人群": raw.get("audience", "对相关技术感兴趣的开发者。"),
+                }
             elif resp.status_code == 429:
-                print(f"  {model} rate-limited, trying next model...")
-                continue  # Try next model
+                print(f"  {model} rate-limited (429), trying next model...")
+                continue
+            elif resp.status_code in (400, 401, 403):
+                # Auth/config error - retrying other models won't help
+                print(f"  {model} auth/config error {resp.status_code}: {resp.text[:150]}")
+                break
             else:
                 print(f"  {model} error {resp.status_code}: {resp.text[:150]}")
-                continue  # Try next model
+                continue
         except json.JSONDecodeError as e:
             print(f"  {model} JSON parse failed: {e}")
-            continue  # Try next model
+            continue
+        except (KeyError, IndexError) as e:
+            print(f"  {model} unexpected response structure: {e}")
+            continue
         except Exception as e:
             print(f"  {model} failed: {e}")
-            continue  # Try next model
+            continue
 
     # Fallback: return basic info
     return {
@@ -407,8 +419,8 @@ def main():
     if not FEISHU_WEBHOOK_URL:
         print("ERROR: FEISHU_WEBHOOK_URL is not set!")
         sys.exit(1)
-    if not OPENROUTER_API_KEY:
-        print("ERROR: OPENROUTER_API_KEY is not set!")
+    if not GEMINI_API_KEY:
+        print("ERROR: GEMINI_API_KEY is not set!")
         sys.exit(1)
 
     # Dedup: skip if already sent today via scheduled run
