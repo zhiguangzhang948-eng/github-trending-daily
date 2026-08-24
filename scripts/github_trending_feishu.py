@@ -27,10 +27,9 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GITHUB_TRENDING_URL = "https://github.com/trending?since=daily"
 GITHUB_API = "https://api.github.com"
 # Google AI Studio (Gemini) - free tier, ~1500 requests/day
-GEMINI_API = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
 GEMINI_MODEL_FALLBACKS = [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
+    "gemini-3.6-flash",
+    "gemini-flash-latest",
 ]
 REQUEST_TIMEOUT = 30
 AI_TIMEOUT = 45  # shorter timeout for AI calls
