@@ -30,7 +30,7 @@ jobs:
       - name: Run trending push
         env:
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python scripts/github_trending_feishu.py

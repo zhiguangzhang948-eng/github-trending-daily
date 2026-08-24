@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-GitHub Trending Daily -> Feishu Push (Webhook + Google Gemini AI version)
+GitHub Trending Daily -> Feishu Push (Webhook + Zhipu GLM AI version)
 
-Scrapes GitHub trending page, picks top 5 repos, uses Google Gemini API
-(gemini-2.5-flash, free tier) to generate easy-to-understand Chinese
-explanations with use cases, and sends a rich card message to Feishu via
-custom bot webhook.
+Scrapes GitHub trending page, picks top 5 repos, uses Zhipu GLM-4-Flash
+(free tier) to generate easy-to-understand Chinese explanations with use
+cases, and sends a rich card message to Feishu via custom bot webhook.
 
 Runs on GitHub Actions - no PC required, completely free.
 """
@@ -22,14 +21,15 @@ from datetime import datetime, timezone, timedelta
 # Config
 # ---------------------------------------------------------------------------
 FEISHU_WEBHOOK_URL = os.environ.get("FEISHU_WEBHOOK_URL", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+ZHIPU_API_KEY = os.environ.get("ZHIPU_API_KEY", "")
 
 GITHUB_TRENDING_URL = "https://github.com/trending?since=daily"
 GITHUB_API = "https://api.github.com"
-# Google AI Studio (Gemini) - free tier, ~1500 requests/day
-GEMINI_MODEL_FALLBACKS = [
-    "gemini-3.6-flash",
-    "gemini-flash-latest",
+# Zhipu GLM - free tier (glm-4-flash is completely free, no billing needed)
+ZHIPU_API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+ZHIPU_MODEL_FALLBACKS = [
+    "glm-4-flash",
+    "glm-4-flash-250414",
 ]
 REQUEST_TIMEOUT = 30
 AI_TIMEOUT = 45  # shorter timeout for AI calls
@@ -160,11 +160,11 @@ def fetch_readme(repo_name):
 
 
 # ---------------------------------------------------------------------------
-# Step 3: Use Gemini API to generate Chinese explanation
+# Step 3: Use Zhipu GLM API to generate Chinese explanation
 # ---------------------------------------------------------------------------
 def generate_explanation(repo):
-    """Use Google Gemini API to generate easy-to-understand Chinese explanation.
-    Uses response_schema to force strict JSON output (no reasoning token issues)."""
+    """Use Zhipu GLM-4-Flash (free) API to generate easy-to-understand Chinese
+    explanation. Uses response_format json_object to force JSON output."""
     readme = fetch_readme(repo["name"])
 
     prompt = f"""你是一个技术科普作者，擅长用大白话解释技术项目。请分析以下GitHub项目，用通俗易懂的中文生成解读。
@@ -175,53 +175,43 @@ def generate_explanation(repo):
 README摘要:
 {readme[:2000]}
 
-请输出以下字段（全部用中文填写内容）:
+请以JSON格式输出以下字段（全部用中文填写内容）:
 - summary: 用15-25个字概括这个项目是干什么的，让非技术人员也能听懂
 - detail: 用2-3句话解释这个项目的核心功能和价值，用大白话，不要用专业术语
 - scenarios: 列出2-3个具体的使用场景，每个场景一行，说明什么人会在什么情况下用它
 - usage: 用1-2句话说明怎么上手使用，比如安装方式或访问方式
-- audience: 用一句话说明这个项目适合什么人"""
+- audience: 用一句话说明这个项目适合什么人
+
+只输出JSON对象，不要包含任何其他文字或markdown代码块标记。"""
 
     system_prompt = "你是一个技术科普作者，擅长用通俗易懂的中文解释技术项目。只输出JSON，不输出其他内容。"
 
-    for model in GEMINI_MODEL_FALLBACKS:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    for model in ZHIPU_MODEL_FALLBACKS:
         payload = {
-            "systemInstruction": {"parts": [{"text": system_prompt}]},
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.7,
-                "maxOutputTokens": 2000,
-                "responseMimeType": "application/json",
-                "responseSchema": {
-                    "type": "OBJECT",
-                    "properties": {
-                        "summary": {"type": "STRING"},
-                        "detail": {"type": "STRING"},
-                        "scenarios": {"type": "STRING"},
-                        "usage": {"type": "STRING"},
-                        "audience": {"type": "STRING"},
-                    },
-                    "required": ["summary", "detail", "scenarios", "usage", "audience"],
-                },
-            },
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.7,
+            "max_tokens": 2000,
+            "response_format": {"type": "json_object"},
         }
 
         try:
             resp = requests.post(
-                url,
-                params={"key": GEMINI_API_KEY},
+                ZHIPU_API_URL,
+                headers={"Authorization": f"Bearer {ZHIPU_API_KEY}"},
                 json=payload,
                 timeout=AI_TIMEOUT,
             )
             if resp.status_code == 200:
                 data = resp.json()
-                text = data["candidates"][0]["content"]["parts"][0]["text"]
+                text = data["choices"][0]["message"]["content"]
                 if not text:
                     print(f"  {model} returned empty content, trying next model...")
                     continue
                 raw = json.loads(text)
-                # Map English schema keys back to Chinese keys used by the card builder
                 return {
                     "一句话简介": raw.get("summary", repo["description"] or "暂无描述"),
                     "详细解释": raw.get("detail", "无法获取AI解读，请访问项目页面了解更多。"),
@@ -418,8 +408,8 @@ def main():
     if not FEISHU_WEBHOOK_URL:
         print("ERROR: FEISHU_WEBHOOK_URL is not set!")
         sys.exit(1)
-    if not GEMINI_API_KEY:
-        print("ERROR: GEMINI_API_KEY is not set!")
+    if not ZHIPU_API_KEY:
+        print("ERROR: ZHIPU_API_KEY is not set!")
         sys.exit(1)
 
     # Dedup: skip if already sent today via scheduled run
